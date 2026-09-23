@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "block-admin-paths",
+      "field": "path_prefix",
+      "match": "prefix",
+      "value": "/admin",
+      "status_code": 403,
+      "reason": "admin_area_forbidden"
+    },
+    {
+      "id": "block-sqlmap-scanner",
+      "field": "header",
+      "match": "contains",
+      "header_name": "user-agent",
+      "value": "sqlmap"
+    },
+    {
+      "id": "block-path-traversal",
+      "field": "path",
+      "match": "regex",
+      "value": "\\.\\./"
+    },
+    {
+      "id": "block-suspicious-query",
+      "field": "query",
+      "match": "contains",
+      "value": "union select"
+    },
+    {
+      "id": "block-bad-net",
+      "field": "ip",
+      "match": "cidr",
+      "value": "192.0.2.0/24"
+    }
+  ]
+}
