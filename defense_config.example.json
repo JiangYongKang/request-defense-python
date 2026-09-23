@@ -1,0 +1,25 @@
+{
+  "rate_limit": {"rate_per_sec": 2.0, "burst": 5},
+  "trusted_proxies": ["10.0.0.0/8", "127.0.0.1/32"],
+  "forward_depth": 1,
+  "max_clients": 10000,
+  "status_codes": {"blocked": 403, "rate_limited": 429},
+  "rules": [
+    {
+      "id": "block-admin",
+      "description": "Never expose the admin area externally",
+      "reason_code": "admin_area",
+      "match": {"field": "path", "op": "prefix", "value": "/admin"}
+    },
+    {
+      "id": "block-scanner-ua",
+      "match": {"field": "header", "name": "user-agent",
+                "op": "regex", "value": "(?i)sqlmap|nikto"}
+    },
+    {
+      "id": "block-sqli-in-q",
+      "match": {"field": "query", "name": "q",
+                "op": "regex", "value": "(?i)union\\s+select"}
+    }
+  ]
+}

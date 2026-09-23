@@ -1,0 +1,7 @@
+[
+  {
+    "id": "block-secret",
+    "reason_code": "secret_area",
+    "match": {"field": "path", "op": "prefix", "value": "/secret"}
+  }
+]
