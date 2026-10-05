@@ -16,6 +16,7 @@ import logging
 import time
 from typing import Any
 
+from .audit import DecisionHistory
 from .config import DefenseConfig
 from .identity import IdentityResolver
 from .ratelimit import RateLimiter
@@ -52,7 +53,12 @@ class DefenseMiddleware:
             tuple(self.config.trusted_proxies),
             hop_count=self.config.proxy_hop_count,
             on_untrusted_forwarded=self.config.on_forwarded_from_untrusted,
+            mode=self.config.forward_trust_mode,
+            max_hops=self.config.max_forward_hops,
+            max_header_bytes=self.config.max_forward_header_bytes,
         )
+        #: 本地可查的最近判定历史（容量 0 时写入零开销）
+        self.history = DecisionHistory(self.config.decision_history_size)
         self.limiter: RateLimiter | None = None
         if self.config.rate_limit_enabled:
             self.limiter = RateLimiter(
@@ -71,6 +77,11 @@ class DefenseMiddleware:
                 "burst": self.config.burst,
                 "trusted_proxies": list(self.config.trusted_proxies),
                 "proxy_hop_count": self.config.proxy_hop_count,
+                "forward_trust_mode": self.config.forward_trust_mode,
+                "max_forward_hops": self.config.max_forward_hops,
+                "max_forward_header_bytes": self.config.max_forward_header_bytes,
+                "decision_history_size": self.config.decision_history_size,
+                "trust_topology": self.resolver.topology_dict(),
                 "on_forwarded_from_untrusted": self.config.on_forwarded_from_untrusted,
                 "rule_engine": self.rules.status_dict(),
             }, ensure_ascii=False),
@@ -189,6 +200,9 @@ class DefenseMiddleware:
                 "peer_ip": identity.peer_ip,
                 "client_id": identity.client_id,
                 "used_forwarded": identity.used_forwarded,
+                "identity_reason": identity.reason,
+                "trust_boundary_index": identity.trust_boundary_index,
+                "forward_chain": identity.chain,
                 "anomalies": list(identity.anomalies),
                 "identity_trace": identity.trace,
             },
@@ -211,3 +225,5 @@ class DefenseMiddleware:
                                        "retry_after_seconds")}
         record["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 3)
         logger.warning(json.dumps(record, ensure_ascii=False))
+        # 同步写入本地有界历史（锁内仅引用拷贝，O(1)；容量 0 时为空操作）
+        self.history.add(record)

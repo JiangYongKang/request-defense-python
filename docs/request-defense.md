@@ -41,12 +41,91 @@
 
 所有判定步骤写入日志的 `input.identity_trace`，可逐条复查为什么采用/忽略了某身份。
 
-### 1.3 对异常输入的稳定性
+### 1.3 多级、部分可信转发链路（chain 模式）
+
+当接入拓扑为「服务 <- 若干层自己可控代理 <- 合作方/第三方网关（不一定每跳都可信）
+<- 客户端」且层数不固定时，固定跳数模型无法表达「中间某一跳不可信」。
+
+设置 `DEFENSE_FORWARD_TRUST_MODE=chain` 后，身份判定改为**从 peer 起逐跳向左
+的信任链校验**（`DEFENSE_PROXY_HOP_COUNT` 此时表示"从服务往回数、声明连续可信的
+代理层数"）：
+
+1. peer 必须可信（不可信则与 1.2 同样处理：忽略转发头 / deny）；
+2. 取 XFF 右数第 1 跳，必须合法且**可信**才允许"穿过"它继续向左；
+3. 如此逐跳，连续可信地穿过最多 `PROXY_HOP_COUNT` 跳；
+4. 在声明的客户端位置（右数第 `PROXY_HOP_COUNT` 跳）遇到的
+   **第一个合法但不可信的地址 = 真实客户端**，采纳为身份；
+5. **一旦中途遇到不可信跳或非法条目：它左侧的任何地址一律不采信**，
+   身份回退到"最近一个已被证实的可信跳"（请求方无法伪造的来源）；
+6. 信任边界**左侧**的原始条目仍会保留在判定链里，角色标为 `ignored_left`，
+   仅用于审计，绝不参与身份。
+
+> 与固定跳数的关键差别：固定跳数只数位置、不校验中间跳；chain 模式要求
+> "从服务往回的连续若干跳全部可信"才肯采信更靠前的地址。合作方网关只要
+> 不在我们的白名单内，它左边（更靠近客户端一侧）的内容就全部不可采信。
+
+#### 层数声明与真实拓扑不一致时，结论始终偏安全
+
+| 情形 | 结论 | anomaly / reason |
+|---|---|---|
+| 声明层数 == 实际可信层数 | 边界处不可信地址采纳为客户端 | `chain_client_at_trust_boundary` |
+| 中间夹了不可信跳（i < 声明层数） | 回退到最近已证实可信跳，左侧全不采信 | `xff_untrusted_midhop` / `chain_untrusted_midhop_fallback` |
+| **配多了**（声明 > 实际层数）：边界位仍是可信代理 | 回退到最近已证实可信跳 | `xff_untrusted_midhop` / `chain_untrusted_midhop_fallback` |
+| 声明层数可信跳走完后左侧仍有条目（**配少了** / 真实层数更多） | 不采信左条目，回退到最左已证实可信跳 | `xff_declared_hops_less_than_chain` / `chain_shorter_than_declared_fallback` |
+| XFF 条目数少于声明层数 | 回退到最近已证实可信跳 | `xff_declared_hops_exceed_chain` / `chain_trusted_depth_exhausted_fallback` |
+| 边界/中间位置条目非法 | 回退到最近已证实可信跳 | `malformed_xff_entry` / `malformed_xff_fallback` |
+
+回退目标永远是**请求方无法伪造的来源**（TCP peer 或由可信代理逐跳证实的地址），
+因此"配多/配少"最坏结果只是把流量聚合成代理地址（过度阻断），
+绝不会把请求方自己带进 XFF 左段的地址当成最终身份。
+
+`identity_reason` 为稳定字符串码，与 `missing_forwarded_headers`、
+`malformed_xff_entry`、`xff_*`、`multiple_*` 等 anomaly 一起，
+可把"没带转发信息 / 格式非法 / 重复头 / 跳数不足 / 中间跳不可信 /
+层数对不上"等情况**程序化地区分开**。
+
+#### 恶意输入的资源上界
+
+* `DEFENSE_MAX_FORWARD_HOPS`（默认 32）：最多解析的 XFF 条目数，
+  超出部分视为左侧内容直接丢弃（`xff_too_many_hops_truncated_left`）；
+* `DEFENSE_MAX_FORWARD_HEADER_BYTES`（默认 8192，最小 64）：转发头原始字节上界，
+  只保留右端预算内尾部并在逗号处对齐（`xff_header_too_long_truncated_left`）；
+* trace / chain 中落盘的字符串再做一层截断，保证单条日志与本地状态有界；
+* 判定全程为 O(上界跳数) 的线性解析，无正则回溯、无按输入量增长的内存分配。
+
+### 1.4 判定的可解释性与本地状态
+
+每条判定的结构化日志（`event=defense_decision`）的 `input` 中稳定包含：
+
+| 字段 | 含义 |
+|---|---|
+| `peer_ip` | TCP 直连对端（信任锚点） |
+| `client_id` | 最终采纳的身份（限流/拦截维度） |
+| `used_forwarded` | 是否采纳了转发信息 |
+| `identity_reason` | 稳定原因码（见上表，程序化区分结论） |
+| `trust_boundary_index` | 越过信任边界的位置（距 XFF 右端，从 1 起；null=未越过） |
+| `forward_chain` | 逐跳结论：`address` / `role`（`peer`/`trusted_hop`/`untrusted_hop`/`client`/`ignored_left`/`unparseable`）/ `trusted_by`（命中的白名单条目） |
+| `identity_trace` | 判定逐步输入与结果 |
+| `anomalies` | 全部异常标记 |
+
+本地可查状态：
+
+* `GET /__defense/status` 新增 `forward_trust_mode` 与 `trust_topology`
+  （当前生效的模式、白名单、声明可信层数、解析上界等）；
+* `GET /__defense/decisions?limit=N`（默认 20，上限 200）返回进程内最近的判定
+  （新的在前）。由 `DEFENSE_DECISION_HISTORY_SIZE` 控制容量，**默认 0 = 关闭**，
+  关闭时写入为空操作；该环形缓冲有界、线程安全，仅用于复查、不参与任何判定。
+
+### 1.5 对异常输入的稳定性
 
 * 非 IP peer（如某些测试客户端的 `testclient`）：视为不可信，不抛异常。
 * IPv4-mapped IPv6（`::ffff:1.2.3.4`）自动归一化为 IPv4 匹配白名单。
 * 容忍 `1.2.3.4:port` 形式的 XFF 条目；方括号 IPv6 `[::1]` 可解析。
+* XFF 条目只接受**纯地址**：带前缀/接口写法（`10.0.0.0/8`、`10.0.0.1/32`）
+  判为非法条目，安全回退。
 * 多个 XFF 头：按接收顺序拼成一条链并记 `multiple_xff_headers`。
+* chain 模式下多个 X-Real-IP 头无法判定哪个可信，直接回退 peer
+  （`multiple_x_real_ip_headers`）。
 
 ---
 
@@ -152,15 +231,25 @@ field 与 match 的合法组合在校验时强制检查（例如 `method` 只支
 | `DEFENSE_RATE_PER_SECOND` | `5.0` | 每客户端平均速率（令牌/秒，正数） |
 | `DEFENSE_BURST` | `10` | 每客户端突发容量（≥1 整数） |
 | `DEFENSE_TRUSTED_PROXIES` | 空 | 可信代理 IP/CIDR，逗号分隔，如 `10.0.0.1,10.1.0.0/16` |
-| `DEFENSE_PROXY_HOP_COUNT` | `1` | 从 XFF 右侧取第几跳（≥1） |
+| `DEFENSE_FORWARD_TRUST_MODE` | `hop_count` | 转发链信任模式：`hop_count`（旧的固定右数第 N 跳，默认/完全兼容）/ `chain`（多级部分可信链路逐跳校验，见 1.3） |
+| `DEFENSE_PROXY_HOP_COUNT` | `1` | hop_count 模式=从 XFF 右侧取第几跳；chain 模式=从服务往回数声明连续可信的代理层数（≥1） |
+| `DEFENSE_MAX_FORWARD_HOPS` | `32` | chain 模式最多解析的 XFF 条目数，超出只留右端（≥1） |
+| `DEFENSE_MAX_FORWARD_HEADER_BYTES` | `8192` | 转发头原始字节上界（最小 64） |
+| `DEFENSE_DECISION_HISTORY_SIZE` | `0` | 本地判定历史容量；0=关闭（默认），写入为空操作 |
 | `DEFENSE_ON_FORWARDED_FROM_UNTRUSTED` | `ignore` | 不可信 peer 携带转发头：`ignore`（忽略+留痕）/ `deny`（403） |
 | `DEFENSE_RULES_FILE` | 空 | 规则 JSON 路径 |
 | `DEFENSE_MAX_CLIENTS` | `100000` | 令牌桶 LRU 硬上限 |
 | `DEFENSE_CLIENT_IDLE_TTL` | `300` | 客户端空闲回收秒数 |
 | `DEFENSE_SWEEP_INTERVAL` | `60` | 空闲扫描周期秒数 |
 
-辅助端点：`GET /__defense/status` 返回限流配置、在线桶数、信任模型与规则引擎状态
-（该端点本身也经过防护层）。
+辅助端点：
+
+* `GET /__defense/status` 返回限流配置、在线桶数、信任模型、`trust_topology`
+  当前生效信任拓扑与规则引擎状态；
+* `GET /__defense/decisions?limit=N` 返回本地最近判定（需
+  `DEFENSE_DECISION_HISTORY_SIZE>0` 开启）。
+
+两个端点本身也经过防护层。
 
 ---
 
@@ -170,13 +259,17 @@ field 与 match 的合法组合在校验时强制检查（例如 `method` 只支
 
 ```bash
 uv sync
-uv run pytest                 # 55 个用例；-s 可看到每个判定的输入/结论打印
+uv run pytest                 # 87 个用例；-s 可看到每个判定的输入/结论打印
 ```
 
 测试覆盖：并发临界（线程池 64×1000、协程 500 并发，允许数严格等于 burst）、
 伪造 XFF / 自填左段 / 跳数篡改、缺失与畸形转发头、
 规则文件缺失/坏 JSON/结构错/部分坏规则、规则不耗令牌、拒绝原因可区分、
-LRU 上限与 20 万身份 churn 下的内存有界。
+LRU 上限与 20 万身份 churn 下的内存有界；
+以及多级链路新场景（`tests/test_identity_chain.py`、
+`tests/test_chain_middleware.py`）：正常多级可信、中间跳不可信、
+声明层数配多/配少、可信与不可信段混合、非法字符/超长链/超多条目/重复头、
+默认 hop_count 模式行为不回归、chain 模式下同一真实身份 500 并发计数严格一致。
 
 ### 6.2 本地起服务手动复现
 
@@ -197,6 +290,29 @@ curl -s -H 'X-Forwarded-For: 198.51.100.7' http://127.0.0.1:8000/
 # 伪造不同左段无法逃避（右跳不变）
 curl -s -H 'X-Forwarded-For: 9.9.9.9, 198.51.100.7' http://127.0.0.1:8000/
 # 直连不可信来源携带 XFF：被忽略，仍按 127.0.0.1 计数并留 anomaly
+```
+
+### 6.2.1 多级部分可信链路（chain 模式）
+
+```bash
+# 两层自有可信代理；开启本地历史便于复现
+DEFENSE_FORWARD_TRUST_MODE=chain DEFENSE_TRUSTED_PROXIES=10.0.0.0/8 \
+DEFENSE_PROXY_HOP_COUNT=2 DEFENSE_DECISION_HISTORY_SIZE=20 \
+DEFENSE_BURST=1 uv run uvicorn main:app --port 8000
+
+# 正常链路：client -> proxy2(10.0.0.2) -> proxy1(10.0.0.1=peer)
+# 身份=203.0.113.9
+curl -s -H 'X-Forwarded-For: 203.0.113.9, 10.0.0.2' http://127.0.0.1:8000/
+# 客户端自填任意左段：身份仍是 203.0.113.9，左段只在 chain 里标 ignored_left
+curl -s -H 'X-Forwarded-For: 1.2.3.4, 203.0.113.9, 10.0.0.2' http://127.0.0.1:8000/
+# 中间夹了不在白名单的合作方网关 192.168.5.5：
+# 左侧一律不采信，回退到已证实可信跳 10.0.0.2（按代理聚合，绝不放松）
+curl -s -H 'X-Forwarded-For: 203.0.113.9, 192.168.5.5, 10.0.0.2' http://127.0.0.1:8000/
+
+# 查看当前生效信任拓扑
+curl -s http://127.0.0.1:8000/__defense/status | python3 -m json.tool
+# 本地复查最近判定（identity_reason / forward_chain / trust_boundary_index）
+curl -s http://127.0.0.1:8000/__defense/decisions | python3 -m json.tool
 ```
 
 ### 6.3 规则拦截复现
@@ -226,3 +342,7 @@ curl -s http://127.0.0.1:8000/__defense/status | python3 -m json.tool
   优先保证判定的严格一致与可解释性，而非锁分片带来的复杂度。
 * **身份判定过度阻断而非放松**：转发信息任何异常都回退为 peer，
   宁可让可信代理自身被聚合计数，也不采用可能被伪造的身份。
+* **多级链路上信任不可传递**：chain 模式只沿"从服务往回的连续可信跳"采信，
+  任何一个不可信/非法跳都切断其左侧全部地址的可信性；声明层数与真实拓扑
+  对不上时只做安全侧回退。新模式默认关闭（`hop_count`），
+  已有环境不改任何配置即与旧版逐字节等价。

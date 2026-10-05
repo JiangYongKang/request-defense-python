@@ -12,6 +12,7 @@ from dataclasses import dataclass
 _TRUE = {"1", "true", "yes", "on", "y", "t"}
 _FALSE = {"0", "false", "no", "off", "n", "f", ""}
 _UNTRUSTED_FORWARD_POLICIES = ("ignore", "deny")
+_FORWARD_TRUST_MODES = ("hop_count", "chain")
 
 
 class DefenseConfigError(ValueError):
@@ -108,6 +109,17 @@ class DefenseConfig:
     proxy_hop_count: int = 1
     #: 直连来源（不在白名单）携带转发头时的策略：ignore 忽略 / deny 拒绝
     on_forwarded_from_untrusted: str = "ignore"
+    #: 转发链信任模式：
+    #:   hop_count —— 旧行为：固定从 XFF 右侧取第 proxy_hop_count 跳
+    #:   chain     —— 逐跳信任校验：从 peer 起每一跳都必须可信，
+    #:                 第一个不可信跳才作为客户端，其左侧任何地址一律不采信
+    forward_trust_mode: str = "hop_count"
+    #: chain 模式下最多解析的 XFF 条目数（超出部分视为左侧伪造内容直接丢弃）
+    max_forward_hops: int = 32
+    #: 所有转发头原始字节总长度上限（防超长链打满解析耗时/内存）
+    max_forward_header_bytes: int = 8192
+    #: 本地判定历史保留条数（0=关闭；仅 /__defense/decisions 查询用）
+    decision_history_size: int = 0
     # ---- 规则 ----
     rules_file: str | None = None
     # ---- 资源回收 ----
@@ -126,6 +138,14 @@ class DefenseConfig:
             on_forwarded_from_untrusted=_get_choice(
                 "DEFENSE_ON_FORWARDED_FROM_UNTRUSTED", "ignore",
                 _UNTRUSTED_FORWARD_POLICIES),
+            forward_trust_mode=_get_choice(
+                "DEFENSE_FORWARD_TRUST_MODE", "hop_count",
+                _FORWARD_TRUST_MODES),
+            max_forward_hops=_get_int("DEFENSE_MAX_FORWARD_HOPS", 32, minimum=1),
+            max_forward_header_bytes=_get_int(
+                "DEFENSE_MAX_FORWARD_HEADER_BYTES", 8192, minimum=64),
+            decision_history_size=_get_int(
+                "DEFENSE_DECISION_HISTORY_SIZE", 0, minimum=0),
             rules_file=(os.environ.get("DEFENSE_RULES_FILE") or None),
             max_clients=_get_int("DEFENSE_MAX_CLIENTS", 100_000, minimum=1),
             client_idle_ttl_seconds=_get_float(

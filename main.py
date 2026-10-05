@@ -1,5 +1,5 @@
 """FastAPI 服务入口：原有接口行为不变，仅在最外层增加防护中间件。"""
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 
 from request_defense.config import DefenseConfig
 from request_defense.middleware import DefenseMiddleware
@@ -24,8 +24,28 @@ def defense_status(request: Request) -> dict:
                            if mw.limiter is not None else 0),
         "trusted_proxies": list(mw.config.trusted_proxies),
         "proxy_hop_count": mw.config.proxy_hop_count,
+        "forward_trust_mode": mw.config.forward_trust_mode,
+        "trust_topology": mw.resolver.topology_dict(),
+        "decision_history_size": mw.config.decision_history_size,
+        "decision_history_records": len(mw.history),
         "on_forwarded_from_untrusted": mw.config.on_forwarded_from_untrusted,
         "rule_engine": mw.rules.status_dict(),
+    }
+
+
+@app.get("/__defense/decisions")
+def defense_decisions(request: Request, limit: int = Query(default=20, ge=1, le=200)) -> dict:
+    """本地最近的防护判定记录（新的在前），用于复现"判定输入 -> 最终结论"。
+
+    仅保留在进程内存中；由 DEFENSE_DECISION_HISTORY_SIZE 控制容量，
+    为 0（默认）时不保留任何记录。
+    """
+    mw: DefenseMiddleware = request.scope["defense_middleware"]
+    return {
+        "enabled": mw.config.decision_history_size > 0,
+        "capacity": mw.config.decision_history_size,
+        "stored": len(mw.history),
+        "records": mw.history.recent(limit),
     }
 
 

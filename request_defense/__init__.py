@@ -1,4 +1,5 @@
 """面向外部请求的防护层：身份判定 -> 规则拦截 -> 限流。"""
+from .audit import DecisionHistory
 from .config import DefenseConfig, DefenseConfigError
 from .identity import ClientIdentity, IdentityResolver
 from .ratelimit import RateLimiter, RateLimitResult, TokenBucket
@@ -16,4 +17,5 @@ __all__ = [
     "RuleEngine",
     "RuleMatch",
     "DefenseMiddleware",
+    "DecisionHistory",
 ]
