@@ -1,7 +1,7 @@
 """信任模型与客户端身份判定。"""
 from __future__ import annotations
 
-from request_defense.identity import IdentityResolver
+from request_defense.identity import IdentityResolver, REASON_BOUNDARY_BREACH
 
 
 def test_spoofed_xff_from_untrusted_peer_is_ignored():
@@ -37,11 +37,37 @@ def test_client_self_added_left_hop_cannot_override_identity():
     assert ident.client_id == "198.51.100.7"
 
 
-def test_hop_count_two():
-    r = IdentityResolver(("10.0.0.1",), hop_count=2)
-    ident = r.resolve("10.0.0.1",
-                      [("x-forwarded-for", "1.2.3.4, 198.51.100.7")])
+def test_hop_count_two_all_hops_trusted_uses_left_candidate():
+    """两级都可信：peer=二级代理 10.0.0.2 可信，右数第 1 跳=一级代理 10.0.0.1
+    也必须可信，才允许采纳右数第 2 跳作为客户端。"""
+    r = IdentityResolver(("10.0.0.1", "10.0.0.2"), hop_count=2)
+    ident = r.resolve("10.0.0.2",
+                      [("x-forwarded-for", "1.2.3.4, 10.0.0.1")])
     assert ident.client_id == "1.2.3.4"
+    assert ident.used_forwarded is True
+    assert ident.verified_trusted_hops == 1
+    assert ident.anomalies == ()
+
+
+def test_hop_count_two_middle_hop_untrusted_is_boundary_breach():
+    """旧实现的不安全假设：hop_count=2 时不校验右数第 1 跳。
+    新模型下该跳不可信即信任边界突破：禁止采信左侧地址，
+    回退到由可信代理写入的边界地址（它不能被请求方伪造成任意受害者）。"""
+    r = IdentityResolver(("10.0.0.2",), hop_count=2)
+    ident = r.resolve("10.0.0.2",
+                      [("x-forwarded-for", "1.2.3.4, 198.51.100.7")])
+    assert ident.client_id == "198.51.100.7"
+    assert ident.used_forwarded is True
+    assert ident.resolution_reason == REASON_BOUNDARY_BREACH
+    assert "untrusted_hop_in_trusted_segment" in ident.anomalies
+    assert ident.trust_boundary == {
+        "hop_index": 1,
+        "boundary_addr": "198.51.100.7",
+        "boundary_match_right": "peer",
+    }
+    # 与"跳数不足/畸形/缺失"等 peer 回退严格区分：回退后 peer_ip 仍是直连，
+    # 但 client_id 不再等于 peer_ip
+    assert ident.client_id != ident.peer_ip
 
 
 def test_insufficient_hops_falls_back_to_peer():

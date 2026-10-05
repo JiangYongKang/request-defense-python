@@ -72,6 +72,7 @@ class DefenseMiddleware:
                 "trusted_proxies": list(self.config.trusted_proxies),
                 "proxy_hop_count": self.config.proxy_hop_count,
                 "on_forwarded_from_untrusted": self.config.on_forwarded_from_untrusted,
+                "identity": self.resolver.status_dict(),
                 "rule_engine": self.rules.status_dict(),
             }, ensure_ascii=False),
         )
@@ -190,6 +191,9 @@ class DefenseMiddleware:
                 "client_id": identity.client_id,
                 "used_forwarded": identity.used_forwarded,
                 "anomalies": list(identity.anomalies),
+                "resolution_reason": identity.resolution_reason,
+                "trust_boundary": identity.trust_boundary,
+                "verified_trusted_hops": identity.verified_trusted_hops,
                 "identity_trace": identity.trace,
             },
             "rate_limit": None,

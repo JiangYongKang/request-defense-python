@@ -25,6 +25,7 @@ def defense_status(request: Request) -> dict:
         "trusted_proxies": list(mw.config.trusted_proxies),
         "proxy_hop_count": mw.config.proxy_hop_count,
         "on_forwarded_from_untrusted": mw.config.on_forwarded_from_untrusted,
+        "identity": mw.resolver.status_dict(),
         "rule_engine": mw.rules.status_dict(),
     }
 
